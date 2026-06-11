@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSlackClient, verifySlackSignature, formatRiskReport } from '@/lib/slack';
+import { getSlackClient, verifySlackSignature, formatRiskReport, getConversationContext } from '@/lib/slack';
 import { analyzeRisk, extractDecision, extractActionItem, detectUnresolvedDiscussion } from '@/lib/qwen';
 import { saveRiskEvent, saveDecision, saveActionItem } from '@/lib/db';
 import { RISK_KEYWORDS, type SlackEvent } from '@/lib/types';
@@ -94,8 +94,11 @@ export async function POST(request: NextRequest) {
       const threadTs = event.thread_ts;
       const replyThread = threadTs || ts;
       const isAppMention = event.type === 'app_mention';
-      // message.channels events have event.type === 'message'
       const isChannelMessage = event.type === 'message';
+
+      // Fetch conversation context in the background — used to ground Qwen's analysis
+      const conversationContext = await getConversationContext(channel, threadTs);
+      console.log(`[Tracium] Fetched ${conversationContext.length} context messages`);
 
       // --- app_mention: always acknowledge and analyze ---
       if (isAppMention) {
@@ -108,7 +111,7 @@ export async function POST(request: NextRequest) {
 
         let riskAnalysis = null;
         try {
-          riskAnalysis = await analyzeRisk(messageText);
+          riskAnalysis = await analyzeRisk(messageText, conversationContext);
           console.log(`[Tracium] Risk analysis complete — score: ${riskAnalysis.riskScore}, unclear: ${riskAnalysis.isUnclearContext}`);
         } catch (qwenErr) {
           console.error('[Tracium] Qwen risk analysis failed:', qwenErr);
@@ -127,7 +130,6 @@ export async function POST(request: NextRequest) {
             await postToSlack(channel, reply, replyThread);
           } catch { /* already logged */ }
 
-          // Store risk event regardless of isUnclearContext
           if (!riskAnalysis.isUnclearContext) {
             saveRiskEvent({
               channel,
@@ -152,7 +154,7 @@ export async function POST(request: NextRequest) {
         if (hasRiskKeywords) {
           let riskAnalysis = null;
           try {
-            riskAnalysis = await analyzeRisk(messageText);
+            riskAnalysis = await analyzeRisk(messageText, conversationContext);
             console.log(`[Tracium] Channel risk analysis — score: ${riskAnalysis.riskScore}, unclear: ${riskAnalysis.isUnclearContext}`);
           } catch (qwenErr) {
             console.error('[Tracium] Qwen channel analysis failed:', qwenErr);
@@ -228,6 +230,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         status: 'processed',
         eventType: event.type,
+        contextMessages: conversationContext.length,
         decisionExtracted: decisionResult.hasDecision,
         actionItemExtracted: actionItemResult.hasActionItem,
         unresolvedDiscussion: unresolvedResult.isUnresolved,
