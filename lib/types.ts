@@ -5,6 +5,7 @@ export const RISK_CATEGORIES = [
   'operational',
   'launch',
   'security',
+  'reputational',
 ] as const;
 
 export type RiskCategory = (typeof RISK_CATEGORIES)[number];
@@ -60,6 +61,18 @@ export const RISK_KEYWORDS: Record<RiskCategory, string[]> = {
     'disable firewall',
     'ignore vulnerability',
   ],
+  reputational: [
+    'public backlash',
+    'brand damage',
+    'pr crisis',
+    'negative press',
+    'customer trust',
+    'reputation risk',
+    'public perception',
+    'media attention',
+    'press release',
+    'bad press',
+  ],
 };
 
 export interface RiskAnalysis {
@@ -68,6 +81,8 @@ export interface RiskAnalysis {
   consequences: string;
   alternative: string;
   actionItem: string;
+  slackReply: string;
+  isUnclearContext?: boolean;
 }
 
 export interface DecisionExtraction {
@@ -90,10 +105,12 @@ export interface UnresolvedDiscussion {
 
 export interface SlackEvent {
   type: string;
+  event_id?: string;
   challenge?: string;
   token?: string;
   event?: {
     type: string;
+    channel_type?: string;
     user?: string;
     text?: string;
     ts?: string;
