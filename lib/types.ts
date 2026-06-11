@@ -103,6 +103,40 @@ export interface UnresolvedDiscussion {
   participants?: string[];
 }
 
+// ── Memory entity extractions ────────────────────────────────────────────────
+
+export interface ExtractedDeadline {
+  task: string;
+  deadlineDate: string;
+  owner?: string;
+}
+
+export interface ExtractedBlocker {
+  description: string;
+  blockedBy?: string;
+  owner?: string;
+}
+
+export interface ExtractedOwnership {
+  person: string;
+  item: string;
+}
+
+export interface ExtractedLaunchDecision {
+  decision: string;
+  reason?: string;
+  scheduledDate?: string;
+}
+
+export interface MemoryEntitiesExtraction {
+  deadlines: ExtractedDeadline[];
+  blockers: ExtractedBlocker[];
+  ownership: ExtractedOwnership[];
+  launchDecisions: ExtractedLaunchDecision[];
+}
+
+// ── Database record types ────────────────────────────────────────────────────
+
 export interface SlackEvent {
   type: string;
   event_id?: string;
@@ -155,6 +189,64 @@ export interface RiskEventRecord {
   slack_ts: string | null;
   slack_thread_ts: string | null;
   created_at: string;
+}
+
+export interface DeadlineRecord {
+  id: string;
+  task: string;
+  deadline_date: string | null;
+  owner: string | null;
+  channel: string;
+  raw_message: string | null;
+  slack_ts: string | null;
+  slack_thread_ts: string | null;
+  created_at: string;
+}
+
+export interface BlockerRecord {
+  id: string;
+  description: string;
+  blocked_by: string | null;
+  owner: string | null;
+  status: string;
+  channel: string;
+  raw_message: string | null;
+  slack_ts: string | null;
+  slack_thread_ts: string | null;
+  created_at: string;
+}
+
+export interface OwnershipRecord {
+  id: string;
+  person: string;
+  item: string;
+  channel: string;
+  raw_message: string | null;
+  slack_ts: string | null;
+  slack_thread_ts: string | null;
+  created_at: string;
+}
+
+export interface LaunchDecisionRecord {
+  id: string;
+  decision: string;
+  reason: string | null;
+  scheduled_date: string | null;
+  channel: string;
+  raw_message: string | null;
+  slack_ts: string | null;
+  slack_thread_ts: string | null;
+  created_at: string;
+}
+
+export interface MemorySearchResult {
+  decisions: DecisionRecord[];
+  actionItems: ActionItemRecord[];
+  deadlines: DeadlineRecord[];
+  blockers: BlockerRecord[];
+  ownership: OwnershipRecord[];
+  launchDecisions: LaunchDecisionRecord[];
+  earliestObservedAt: string | null;
 }
 
 // Future integration types (prepared but not implemented)
