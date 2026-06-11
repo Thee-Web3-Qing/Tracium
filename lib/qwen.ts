@@ -50,7 +50,11 @@ async function callQwen(messages: QwenMessage[]): Promise<string> {
   return content;
 }
 
-export async function analyzeRisk(message: string): Promise<RiskAnalysis> {
+/**
+ * Analyze a message for risk. Optionally accepts conversation context
+ * (recent channel messages) to ground the analysis in the full discussion.
+ */
+export async function analyzeRisk(message: string, context?: string[]): Promise<RiskAnalysis> {
   const systemPrompt = `You are the Chief of Operations at a fast-moving tech company. You watch team conversations and speak up when you spot something that could genuinely hurt the team, the product, or the business.
 
 Your job is NOT to produce formal risk reports. You are a senior operator with strong instincts who joins the conversation naturally — direct, practical, and human. You sound like someone the team actually respects and listens to.
@@ -70,7 +74,11 @@ Examples of good slackReply tone:
 - "Worth flagging: if we bypass the security review here and something goes wrong, we own that. Thirty minutes with the security team now saves days of cleanup later."
 - "I'd pump the brakes on this one. Skipping staging means we're essentially testing in production. What's the actual deadline pressure?"`;
 
-  const userPrompt = `Read this team message and assess whether it contains a real business risk worth raising:
+  const contextBlock = context && context.length > 0
+    ? `Recent conversation context (oldest → newest):\n${context.map((m, i) => `[${i + 1}] ${m}`).join('\n')}\n\n`
+    : '';
+
+  const userPrompt = `${contextBlock}Read this team message and assess whether it contains a real business risk worth raising:
 
 "${message}"
 
