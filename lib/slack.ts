@@ -21,7 +21,6 @@ export function verifySlackSignature(
     return true;
   }
 
-  // Check timestamp to prevent replay attacks (5 minute window)
   const currentTime = Math.floor(Date.now() / 1000);
   const requestTime = parseInt(timestamp, 10);
 
@@ -52,8 +51,6 @@ export function formatRiskReport(analysis: {
   if (analysis.slackReply) {
     return analysis.slackReply;
   }
-
-  // Fallback if slackReply is not present
   return `⚠️ Heads up — there's something worth reviewing here.\n\n${analysis.consequences}\n\n*Recommended action:* ${analysis.actionItem}`;
 }
 
@@ -75,7 +72,7 @@ export async function getConversationContext(
         limit,
       });
       return (result.messages ?? [])
-        .filter((m) => !m.bot_id && m.subtype !== 'bot_message')
+        .filter((m) => !m.bot_id)
         .map((m) => m.text ?? '')
         .filter(Boolean)
         .reverse();
@@ -85,7 +82,7 @@ export async function getConversationContext(
         limit,
       });
       return (result.messages ?? [])
-        .filter((m) => !m.bot_id && m.subtype !== 'bot_message')
+        .filter((m) => !m.bot_id)
         .map((m) => m.text ?? '')
         .filter(Boolean)
         .reverse();
