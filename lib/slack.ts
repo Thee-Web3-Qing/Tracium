@@ -42,32 +42,17 @@ export function verifySlackSignature(
 }
 
 export function formatRiskReport(analysis: {
+  slackReply?: string;
   riskScore: number;
   category: string;
   consequences: string;
   alternative: string;
   actionItem: string;
 }): string {
-  const riskEmoji = analysis.riskScore >= 8
-    ? ':rotating_light:'
-    : analysis.riskScore >= 5
-      ? ':warning:'
-      : ':exclamation:';
+  if (analysis.slackReply) {
+    return analysis.slackReply;
+  }
 
-  const formattedScore = analysis.riskScore.toFixed(1);
-
-  return `:rotating_light: *Tracium Risk Detected* ${riskEmoji}
-
-*Risk Score:* ${formattedScore}/10
-*Category:* ${analysis.category.charAt(0).toUpperCase() + analysis.category.slice(1)}
-*Potential Consequences:*
-${analysis.consequences}
-
-*Suggested Alternative:*
-${analysis.alternative}
-
-*Recommended Action:*
-${analysis.actionItem}
-
-_This is an automated risk analysis. Please review carefully before proceeding._`;
+  // Fallback if slackReply is not present
+  return `⚠️ Heads up — there's something worth reviewing here.\n\n${analysis.consequences}\n\n*Recommended action:* ${analysis.actionItem}`;
 }
