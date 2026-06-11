@@ -1,7 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSlackClient, verifySlackSignature, formatRiskReport, getConversationContext } from '@/lib/slack';
-import { analyzeRisk, extractDecision, extractActionItem, detectUnresolvedDiscussion } from '@/lib/qwen';
-import { saveRiskEvent, saveDecision, saveActionItem } from '@/lib/db';
+import {
+  analyzeRisk,
+  extractDecision,
+  extractActionItem,
+  detectUnresolvedDiscussion,
+  extractMemoryEntities,
+  generateMemoryResponse,
+} from '@/lib/qwen';
+import {
+  saveRiskEvent,
+  saveDecision,
+  saveActionItem,
+  saveDeadline,
+  saveBlocker,
+  saveOwnership,
+  saveLaunchDecision,
+  searchMemory,
+} from '@/lib/db';
 import { RISK_KEYWORDS, type SlackEvent } from '@/lib/types';
 
 // In-memory deduplication — prevents duplicate processing when Slack retries events
@@ -11,21 +27,15 @@ const STRONG_RISK_THRESHOLD = 6;
 
 function containsRiskKeywords(text: string): boolean {
   const lowerText = text.toLowerCase();
-  return Object.values(RISK_KEYWORDS)
-    .flat()
-    .some((keyword) => lowerText.includes(keyword));
+  return Object.values(RISK_KEYWORDS).flat().some((kw) => lowerText.includes(kw));
 }
 
 async function postToSlack(channel: string, text: string, threadTs?: string): Promise<void> {
-  const slackClient = getSlackClient();
+  const client = getSlackClient();
   try {
-    await slackClient.chat.postMessage({
-      channel,
-      text,
-      thread_ts: threadTs,
-    });
+    await client.chat.postMessage({ channel, text, thread_ts: threadTs });
   } catch (err: unknown) {
-    console.error('[Tracium] Slack chat.postMessage failed:', JSON.stringify(err, null, 2));
+    console.error('[Tracium] chat.postMessage failed:', JSON.stringify(err, null, 2));
     throw err;
   }
 }
@@ -35,7 +45,6 @@ export async function POST(request: NextRequest) {
     const rawBody = await request.text();
     const body: SlackEvent = JSON.parse(rawBody);
 
-    // Verify Slack signature
     const timestamp = request.headers.get('x-slack-request-timestamp') || '';
     const signature = request.headers.get('x-slack-signature') || '';
 
@@ -43,22 +52,19 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
     }
 
-    // Handle URL verification during Slack app setup
     if (body.type === 'url_verification' && body.challenge) {
       return NextResponse.json({ challenge: body.challenge });
     }
 
-    // Handle event callbacks
     if (body.type === 'event_callback' && body.event) {
 
-      // Deduplicate using event_id — Slack retries events on 200 timeout
+      // Deduplicate — Slack retries on timeout
       if (body.event_id) {
         if (processedEventIds.has(body.event_id)) {
           console.log(`[Tracium] Duplicate event ignored: ${body.event_id}`);
           return NextResponse.json({ status: 'duplicate' });
         }
         processedEventIds.add(body.event_id);
-        // Prevent unbounded memory growth
         if (processedEventIds.size > 5000) {
           const oldest = processedEventIds.values().next().value;
           if (oldest) processedEventIds.delete(oldest);
@@ -66,136 +72,115 @@ export async function POST(request: NextRequest) {
       }
 
       const event = body.event;
+      console.log(`[Tracium] event type: ${event.type}, channel_type: ${event.channel_type ?? 'n/a'}, text: ${event.text ?? '(none)'}`);
 
-      // Log the full incoming event type and text for debugging
-      console.log(`[Tracium] Incoming event type: ${event.type}, channel_type: ${event.channel_type ?? 'n/a'}, text: ${event.text ?? '(none)'}`);
-
-      // Ignore bot messages (including our own) to avoid loops
       if (event.bot_id || event.subtype === 'bot_message') {
-        console.log('[Tracium] Ignoring bot message');
         return NextResponse.json({ status: 'ignored', reason: 'bot_message' });
       }
 
-      // Only handle app_mention and message events
       if (event.type !== 'app_mention' && event.type !== 'message') {
-        console.log(`[Tracium] Ignoring unhandled event type: ${event.type}`);
         return NextResponse.json({ status: 'ignored', reason: 'unhandled_event_type' });
       }
 
-      // Require text and channel
       if (!event.text || !event.channel || !event.ts) {
-        console.log('[Tracium] Ignoring event: missing text, channel, or ts');
         return NextResponse.json({ status: 'ignored', reason: 'invalid_event' });
       }
 
       const messageText = event.text;
-      const channel = event.channel;
-      const ts = event.ts;
-      const threadTs = event.thread_ts;
+      const channel     = event.channel;
+      const ts          = event.ts;
+      const threadTs    = event.thread_ts;
       const replyThread = threadTs || ts;
-      const isAppMention = event.type === 'app_mention';
+      const isAppMention    = event.type === 'app_mention';
       const isChannelMessage = event.type === 'message';
 
-      // Fetch conversation context in the background — used to ground Qwen's analysis
-      const conversationContext = await getConversationContext(channel, threadTs);
-      console.log(`[Tracium] Fetched ${conversationContext.length} context messages`);
+      // Fetch conversation context and stored memory in parallel
+      const [conversationContext, memory] = await Promise.all([
+        getConversationContext(channel, threadTs),
+        searchMemory(),
+      ]);
+      console.log(`[Tracium] context: ${conversationContext.length} msgs, memory: ${
+        memory.decisions.length + memory.actionItems.length + memory.deadlines.length +
+        memory.blockers.length + memory.ownership.length + memory.launchDecisions.length
+      } records`);
 
-      // --- app_mention: always acknowledge and analyze ---
+      // ── app_mention: memory-first response ────────────────────────────────
       if (isAppMention) {
-        console.log('[Tracium] app_mention received — sending acknowledgment');
+        // Acknowledge immediately
         try {
-          await postToSlack(channel, '✅ Tracium received your message. Analyzing risk now...', replyThread);
-        } catch {
-          // Acknowledgment failed — log already happened in postToSlack, continue anyway
-        }
+          await postToSlack(channel, '✅ Tracium is on it — checking the records...', replyThread);
+        } catch { /* already logged */ }
 
-        let riskAnalysis = null;
+        // Try memory-grounded response first
+        let replied = false;
         try {
-          riskAnalysis = await analyzeRisk(messageText, conversationContext);
-          console.log(`[Tracium] Risk analysis complete — score: ${riskAnalysis.riskScore}, unclear: ${riskAnalysis.isUnclearContext}`);
-        } catch (qwenErr) {
-          console.error('[Tracium] Qwen risk analysis failed:', qwenErr);
-          try {
-            await postToSlack(
-              channel,
-              '⚠️ I ran into an issue completing the analysis. Please try again or flag this manually for the team.',
-              replyThread
-            );
-          } catch { /* already logged */ }
+          const memoryReply = await generateMemoryResponse(messageText, memory, conversationContext);
+          await postToSlack(channel, memoryReply, replyThread);
+          replied = true;
+          console.log('[Tracium] Memory response sent');
+        } catch (err) {
+          console.error('[Tracium] generateMemoryResponse failed:', err);
         }
 
-        if (riskAnalysis) {
-          const reply = formatRiskReport(riskAnalysis);
+        // If memory response failed, fall back to risk analysis
+        if (!replied) {
           try {
-            await postToSlack(channel, reply, replyThread);
-          } catch { /* already logged */ }
-
-          if (!riskAnalysis.isUnclearContext) {
-            saveRiskEvent({
-              channel,
-              message: messageText,
-              riskScore: riskAnalysis.riskScore,
-              category: riskAnalysis.category,
-              consequences: riskAnalysis.consequences,
-              alternative: riskAnalysis.alternative,
-              actionItem: riskAnalysis.actionItem,
-              slackTs: ts,
-              slackThreadTs: threadTs,
-            }).catch((err) => console.error('[Tracium] saveRiskEvent failed:', err));
-          }
-        }
-      }
-
-      // --- message.channels: only reply on strong detected risk ---
-      if (isChannelMessage) {
-        const hasRiskKeywords = containsRiskKeywords(messageText);
-        console.log(`[Tracium] Channel message — keywords detected: ${hasRiskKeywords}`);
-
-        if (hasRiskKeywords) {
-          let riskAnalysis = null;
-          try {
-            riskAnalysis = await analyzeRisk(messageText, conversationContext);
-            console.log(`[Tracium] Channel risk analysis — score: ${riskAnalysis.riskScore}, unclear: ${riskAnalysis.isUnclearContext}`);
-          } catch (qwenErr) {
-            console.error('[Tracium] Qwen channel analysis failed:', qwenErr);
-          }
-
-          if (riskAnalysis && !riskAnalysis.isUnclearContext && riskAnalysis.riskScore >= STRONG_RISK_THRESHOLD) {
+            const riskAnalysis = await analyzeRisk(messageText, conversationContext);
             const reply = formatRiskReport(riskAnalysis);
+            await postToSlack(channel, reply, replyThread);
+            if (!riskAnalysis.isUnclearContext) {
+              saveRiskEvent({
+                channel, message: messageText,
+                riskScore: riskAnalysis.riskScore, category: riskAnalysis.category,
+                consequences: riskAnalysis.consequences, alternative: riskAnalysis.alternative,
+                actionItem: riskAnalysis.actionItem, slackTs: ts, slackThreadTs: threadTs,
+              }).catch((e) => console.error('[Tracium] saveRiskEvent failed:', e));
+            }
+          } catch (err) {
+            console.error('[Tracium] Risk analysis fallback failed:', err);
             try {
-              await postToSlack(channel, reply, replyThread);
+              await postToSlack(channel, '⚠️ I ran into an issue completing the analysis. Please try again or flag this manually.', replyThread);
             } catch { /* already logged */ }
-
-            saveRiskEvent({
-              channel,
-              message: messageText,
-              riskScore: riskAnalysis.riskScore,
-              category: riskAnalysis.category,
-              consequences: riskAnalysis.consequences,
-              alternative: riskAnalysis.alternative,
-              actionItem: riskAnalysis.actionItem,
-              slackTs: ts,
-              slackThreadTs: threadTs,
-            }).catch((err) => console.error('[Tracium] saveRiskEvent failed:', err));
-          } else {
-            console.log('[Tracium] Channel message risk below threshold or unclear — no reply sent');
           }
         }
       }
 
-      // --- Always extract and store decisions + action items for both event types ---
-      const [decisionResult, actionItemResult, unresolvedResult] = await Promise.all([
-        extractDecision(messageText).catch((err) => {
-          console.error('[Tracium] extractDecision failed:', err);
+      // ── channel messages: only reply on strong risk ────────────────────────
+      if (isChannelMessage && containsRiskKeywords(messageText)) {
+        try {
+          const riskAnalysis = await analyzeRisk(messageText, conversationContext);
+          console.log(`[Tracium] channel risk score: ${riskAnalysis.riskScore}, unclear: ${riskAnalysis.isUnclearContext}`);
+          if (!riskAnalysis.isUnclearContext && riskAnalysis.riskScore >= STRONG_RISK_THRESHOLD) {
+            await postToSlack(channel, formatRiskReport(riskAnalysis), replyThread);
+            saveRiskEvent({
+              channel, message: messageText,
+              riskScore: riskAnalysis.riskScore, category: riskAnalysis.category,
+              consequences: riskAnalysis.consequences, alternative: riskAnalysis.alternative,
+              actionItem: riskAnalysis.actionItem, slackTs: ts, slackThreadTs: threadTs,
+            }).catch((e) => console.error('[Tracium] saveRiskEvent failed:', e));
+          }
+        } catch (err) {
+          console.error('[Tracium] channel risk analysis failed:', err);
+        }
+      }
+
+      // ── Extract and store all organizational memory entities ───────────────
+      const [decisionResult, actionItemResult, , memoryEntities] = await Promise.all([
+        extractDecision(messageText).catch((e) => {
+          console.error('[Tracium] extractDecision failed:', e);
           return { hasDecision: false, decision: undefined, owner: undefined };
         }),
-        extractActionItem(messageText).catch((err) => {
-          console.error('[Tracium] extractActionItem failed:', err);
+        extractActionItem(messageText).catch((e) => {
+          console.error('[Tracium] extractActionItem failed:', e);
           return { hasActionItem: false, task: undefined, owner: undefined };
         }),
-        detectUnresolvedDiscussion(messageText).catch((err) => {
-          console.error('[Tracium] detectUnresolvedDiscussion failed:', err);
-          return { isUnresolved: false, topic: undefined, participants: [] };
+        detectUnresolvedDiscussion(messageText).catch((e) => {
+          console.error('[Tracium] detectUnresolvedDiscussion failed:', e);
+          return { isUnresolved: false };
+        }),
+        extractMemoryEntities(messageText).catch((e) => {
+          console.error('[Tracium] extractMemoryEntities failed:', e);
+          return { deadlines: [], blockers: [], ownership: [], launchDecisions: [] };
         }),
       ]);
 
@@ -203,46 +188,63 @@ export async function POST(request: NextRequest) {
 
       if (decisionResult.hasDecision && decisionResult.decision) {
         storagePromises.push(
-          saveDecision({
-            channel,
-            decision: decisionResult.decision,
-            owner: decisionResult.owner,
-            slackTs: ts,
-            slackThreadTs: threadTs,
-          })
+          saveDecision({ channel, decision: decisionResult.decision, owner: decisionResult.owner, slackTs: ts, slackThreadTs: threadTs })
         );
       }
 
       if (actionItemResult.hasActionItem && actionItemResult.task) {
         storagePromises.push(
-          saveActionItem({
-            channel,
-            task: actionItemResult.task,
-            owner: actionItemResult.owner,
-            slackTs: ts,
-            slackThreadTs: threadTs,
-          })
+          saveActionItem({ channel, task: actionItemResult.task, owner: actionItemResult.owner, slackTs: ts, slackThreadTs: threadTs })
+        );
+      }
+
+      for (const d of memoryEntities.deadlines) {
+        storagePromises.push(
+          saveDeadline({ task: d.task, deadlineDate: d.deadlineDate, owner: d.owner ?? undefined, channel, rawMessage: messageText, slackTs: ts, slackThreadTs: threadTs })
+        );
+      }
+
+      for (const b of memoryEntities.blockers) {
+        storagePromises.push(
+          saveBlocker({ description: b.description, blockedBy: b.blockedBy ?? undefined, owner: b.owner ?? undefined, channel, rawMessage: messageText, slackTs: ts, slackThreadTs: threadTs })
+        );
+      }
+
+      for (const o of memoryEntities.ownership) {
+        storagePromises.push(
+          saveOwnership({ person: o.person, item: o.item, channel, rawMessage: messageText, slackTs: ts, slackThreadTs: threadTs })
+        );
+      }
+
+      for (const l of memoryEntities.launchDecisions) {
+        storagePromises.push(
+          saveLaunchDecision({ decision: l.decision, reason: l.reason ?? undefined, scheduledDate: l.scheduledDate ?? undefined, channel, rawMessage: messageText, slackTs: ts, slackThreadTs: threadTs })
         );
       }
 
       await Promise.all(storagePromises);
 
+      console.log(`[Tracium] stored: decisions=${decisionResult.hasDecision ? 1 : 0}, actions=${actionItemResult.hasActionItem ? 1 : 0}, deadlines=${memoryEntities.deadlines.length}, blockers=${memoryEntities.blockers.length}, ownership=${memoryEntities.ownership.length}, launches=${memoryEntities.launchDecisions.length}`);
+
       return NextResponse.json({
         status: 'processed',
         eventType: event.type,
         contextMessages: conversationContext.length,
-        decisionExtracted: decisionResult.hasDecision,
-        actionItemExtracted: actionItemResult.hasActionItem,
-        unresolvedDiscussion: unresolvedResult.isUnresolved,
+        memoryRecords: memory.decisions.length + memory.actionItems.length,
+        extracted: {
+          decision: decisionResult.hasDecision,
+          actionItem: actionItemResult.hasActionItem,
+          deadlines: memoryEntities.deadlines.length,
+          blockers: memoryEntities.blockers.length,
+          ownership: memoryEntities.ownership.length,
+          launchDecisions: memoryEntities.launchDecisions.length,
+        },
       });
     }
 
     return NextResponse.json({ status: 'ignored', reason: 'unknown_event_type' });
   } catch (error) {
     console.error('[Tracium] Error processing Slack event:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
